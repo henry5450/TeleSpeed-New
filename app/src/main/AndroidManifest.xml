@@ -1,26 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools"
-    package="io.github.tehcneko.telespeed">
+    xmlns:tools="http://schemas.android.com/tools">
 
+    <!--
+        现代 Xposed API (libxposed API 102) 不再使用 AndroidManifest 中的
+        xposedmodule / xposeddescription / xposedminversion / xposedscope 元数据，
+        模块信息改为声明在 META-INF/xposed/ 下：
+          module.prop     -> minApiVersion / targetApiVersion / staticScope
+          java_init.list  -> 模块入口类
+          scope.list      -> 作用域包名
+    -->
     <application
         android:allowBackup="true"
         android:label="@string/app_name"
+        android:description="@string/xposed_description"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         tools:ignore="AllowBackup,MissingApplicationIcon">
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="@string/xposed_description" />
-        <meta-data
-            android:name="xposedminversion"
-            android:value="93" />
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/xposedscope" />
 
         <activity
             android:name=".SettingsActivity"
@@ -30,6 +26,12 @@
                 <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
             </intent-filter>
         </activity>
+
+        <!--
+            RemotePreferences 的跨进程通道由 io.github.libxposed:service 依赖自带的
+            AndroidManifest 提供（provider 为 io.github.libxposed.service.XposedProvider，
+            authority 为 ${applicationId}.XposedService），构建时会自动合并，此处无需重复声明。
+        -->
     </application>
 
 </manifest>
