@@ -100,6 +100,9 @@ ellipi.messenger
 需要 JDK 17+ 与 Android SDK（`compileSdk 37` / `build-tools 37.0.0`）。
 工具链版本：Gradle 9.8.0、AGP 9.4.1。
 
+## 免责声明
+该模块可能导致的账号封禁，用户自行承担风险
+
 ## 许可证
 
 [GPL-3.0](LICENSE)
