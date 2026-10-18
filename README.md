@@ -65,6 +65,16 @@ ellipi.messenger
 4. 打开模块的设置界面选择档位（默认「开启」）
 5. 重新打开 Telegram 使设置生效
 
+## 版本兼容性
+
+| Telegram 版本 | 状态 |
+| --- | --- |
+| 12.10.5 (71059) | ✅ 已验证 |
+| 13.0.3 (71839) | ✅ 已验证（需 v2.0.1+） |
+
+Telegram 13.x 重构了下载参数体系并新增了一套下载节流机制，v2.0.0 在 13.x 上速度会明显下降
+（实测 100MB 需 25s，而 12.10.5 只需 8s）。v2.0.1 针对该机制做了适配，恢复到约 10s。
+
 ## 技术说明
 
 现代 libxposed API 的 Hook 模型（`hook(Executable)` + `Hooker.intercept(Chain)` 链式拦截）
@@ -90,6 +100,25 @@ ellipi.messenger
 配置读写改用框架的 RemotePreferences（宿主侧 `XposedInterface.getRemotePreferences` 读，
 模块应用侧 `XposedService.getRemotePreferences` 读写），不再依赖已被 Android 7.0 禁用的
 `MODE_WORLD_READABLE`。
+
+### Telegram 13.x 的下载节流
+
+13.x 的 `FileLoadOperation` 新增了以下字段：
+
+```
+downloadConnectionsCount:I            downloadRequestPacer:DownloadRequestPacer
+isAudioDocument:Z                     paceDocumentRequests:Z
+pacedDownloadRequest:Runnable         useDownloadByteBudget:Z
+```
+
+普通文档下载时 `useDownloadByteBudget` 为 true，此时：
+
+- 非会员的 `downloadConnectionsCount` 被设为 2（会员为 8），用于计算
+  `connectionNum = requestsCount & (downloadConnectionsCount - 1)`；
+- 请求会带上 `RequestFlagDownloadByteBudget (0x40000)`，由 native 层执行吞吐限制。
+
+本模块在 `start()` 的 after 阶段把连接数提到 8，并关闭 `useDownloadByteBudget`，
+从而绕过这套限制。字段探测保证在 12.10.5（无这些字段）上不受影响。
 
 ## 构建
 

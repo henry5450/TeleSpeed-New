@@ -48,6 +48,9 @@ public class SpeedHook extends XposedModule {
             "org.telegram.messenger.FileLoadOperation$RequestInfo";
     private static final String CLASS_TL_ERROR = "org.telegram.tgnet.TLRPC$TL_error";
 
+    /** Telegram 会员档位的下载连接数；非会员默认只有 2。必须是 2 的幂。 */
+    private static final int DOWNLOAD_CONNECTIONS_COUNT = 8;
+
     private static long speedUpShown = 0;
     private XSharedPreferences prefs;
     private XModuleResources res;
@@ -128,12 +131,30 @@ public class SpeedHook extends XposedModule {
      * 使所有下载路径都遵循用户档位。
      */
     private void hookStart(ClassLoader classLoader) {
+        // Telegram 13.x 新增了下载预算机制（普通文档下载时启用），
+        // 非会员会被限制在 2 条连接上，这是 13.x 下载明显变慢的根因。
+        // 12.10.5 没有该字段，需要先探测再决定是否启用相关修正。
+        final boolean hasByteBudgetField = hasField(classLoader, "useDownloadByteBudget");
+
         XposedHelpers.findAndHookMethod(CLASS_FILE_LOAD_OPERATION, classLoader, "start",
                 CLASS_FILE_LOAD_OPERATION_STREAM, long.class, boolean.class, new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                         Object operation = param.thisObject;
                         var speed = prefs.getString(KEY_SPEED, BOOST_AVERAGE);
+
+                        if (hasByteBudgetField
+                                && XposedHelpers.getBooleanField(operation, "useDownloadByteBudget")) {
+                            // 与 Telegram 会员档位对齐（8 条连接）。该值参与
+                            // connectionNum = requestsCount & (count - 1) 的计算，
+                            // 必须是 2 的幂才能覆盖完整的连接序号。
+                            XposedHelpers.setIntField(operation, "downloadConnectionsCount",
+                                    DOWNLOAD_CONNECTIONS_COUNT);
+                            // 关闭下载字节预算：开启时请求会带上
+                            // RequestFlagDownloadByteBudget (0x40000)，
+                            // 该标志会让 native 层对下载请求做吞吐限制。
+                            XposedHelpers.setBooleanField(operation, "useDownloadByteBudget", false);
+                        }
 
                         if (XposedHelpers.getBooleanField(operation, "forceSmallChunk")) {
                             // 服务器返回 LIMIT_INVALID 后 Telegram 会主动把分块降到 32KB，
@@ -188,6 +209,25 @@ public class SpeedHook extends XposedModule {
                                 maxRequestsOf(speed));
                     }
                 });
+    }
+
+    /** 探测目标类（含父类）是否存在指定字段，用于兼容不同 Telegram 版本。 */
+    private static boolean hasField(ClassLoader classLoader, String fieldName) {
+        try {
+            Class<?> clazz = XposedHelpers.findClass(CLASS_FILE_LOAD_OPERATION, classLoader);
+            for (Class<?> current = clazz; current != null; current = current.getSuperclass()) {
+                try {
+                    current.getDeclaredField(fieldName);
+                    return true;
+                } catch (NoSuchFieldException ignored) {
+                    // 继续向父类查找
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("探测字段失败: " + fieldName);
+            XposedBridge.log(t);
+        }
+        return false;
     }
 
     /** 档位对应的分块大小（字节）。BOOST_NONE 即 Telegram 自身的默认值。 */
