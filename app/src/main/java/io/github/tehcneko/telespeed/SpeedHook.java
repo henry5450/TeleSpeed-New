@@ -18,19 +18,17 @@ import io.github.tehcneko.telespeed.compat.XposedHelpers;
 /**
  * 模块入口。已迁移到 modern Xposed API（libxposed API 102）。
  *
- * <p>旧版写法通过 assets/xposed_init + IXposedHookLoadPackage/IXposedHookZygoteInit 接入；
- * 现代写法改为继承 {@link XposedModule}，入口类由 META-INF/xposed/java_init.list 声明。
- * 旧的 zygote 注入已不再允许，原先在 initZygote 中完成的初始化移至 onModuleLoaded。
- *
- * <p>Hook 目标为 {@code org.telegram.messenger.FileLoadOperation}。Telegram 的下载参数分两级：
+ * <p>模块需要同时适配两类 Telegram 版本：
  * <ul>
- *   <li>{@code updateParams()} 计算 {@code downloadChunkSizeBig} / {@code maxDownloadRequests} 等
- *       "档位字段"，但它们在 {@code start()} 里才被折算到真正生效的
- *       {@code currentDownloadChunkSize} / {@code currentMaxDownloadRequests}；</li>
- *   <li>{@code start()} 的折算只在 {@code currentDownloadChunkSize == 0} 时执行一次，
- *       因此直接改档位字段并不足以覆盖所有下载路径（流式播放、故事、纠错降级各走各的分支）。</li>
+ *   <li><b>未混淆</b>（12.10.5、13.0.3）：{@code FileLoadOperation} 及其原名字段/方法；</li>
+ *   <li><b>已混淆</b>（13.2.0+）：类名 {@code h7}，方法/字段全部被 R8 重命名。</li>
  * </ul>
- * 所以这里同时挂三处：档位字段、{@code start()} 折算结果、以及请求失败后的纠错回写。
+ * 启动时先探测 {@code FileLoadOperation} 是否存在，不存在则回退到混淆版本。
+ *
+ * <p>Telegram 的下载参数分两级：{@code updateParams()} 计算
+ * {@code downloadChunkSizeBig} / {@code maxDownloadRequests} 等"档位字段"，再由 {@code start()}
+ * 折算成真正被请求逻辑消费的 {@code currentDownloadChunkSize} / {@code currentMaxDownloadRequests}。
+ * 折算只在 current 字段为 0 时发生一次，因此两条路径都要覆盖。
  */
 public class SpeedHook extends XposedModule {
     private final static String TAG = "SpeedHook";
@@ -41,11 +39,17 @@ public class SpeedHook extends XposedModule {
     private final static int TYPE_ERROR_SUBTITLE = 4;
     private final static long DEFAULT_MAX_FILE_SIZE = 1024L * 1024L * 2000L;
 
+    // ---- 未混淆版本（12.10.5 / 13.0.3） ----
     private static final String CLASS_FILE_LOAD_OPERATION = "org.telegram.messenger.FileLoadOperation";
     private static final String CLASS_FILE_LOAD_OPERATION_STREAM =
             "org.telegram.messenger.FileLoadOperationStream";
     private static final String CLASS_REQUEST_INFO =
             "org.telegram.messenger.FileLoadOperation$RequestInfo";
+
+    // ---- 混淆版本（13.2.0+）。类名可能随版本变化，靠特征字符串核对过 ----
+    private static final String CLASS_FILE_LOAD_OPERATION_OBF = "org.telegram.messenger.h7";
+    private static final String CLASS_REQUEST_INFO_OBF = "org.telegram.messenger.g7";
+
     private static final String CLASS_TL_ERROR = "org.telegram.tgnet.TLRPC$TL_error";
 
     /** Telegram 会员档位的下载连接数；非会员默认只有 2。必须是 2 的幂。 */
@@ -78,9 +82,13 @@ public class SpeedHook extends XposedModule {
             return;
         }
         try {
-            hookUpdateParams(classLoader);
-            hookStart(classLoader);
-            hookProcessRequestResult(classLoader);
+            if (classExists(CLASS_FILE_LOAD_OPERATION, classLoader)) {
+                hookLegacy(classLoader);
+            } else if (classExists(CLASS_FILE_LOAD_OPERATION_OBF, classLoader)) {
+                hookObfuscated(classLoader);
+            } else {
+                throw new ClassNotFoundException("找不到 FileLoadOperation 或其混淆版本");
+            }
         } catch (Throwable t) {
             XposedBridge.log(t);
             XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
@@ -95,11 +103,18 @@ public class SpeedHook extends XposedModule {
         }
     }
 
-    /**
-     * 覆盖 "档位字段"。这些值随后会被 start() 折算到 current* 字段，
-     * 同时 maxCdnParts 直接决定 CDN 分片数量。
-     */
-    private void hookUpdateParams(ClassLoader classLoader) {
+    // ==================================================================
+    // 未混淆路径（12.10.5 / 13.0.3）
+    // ==================================================================
+
+    private void hookLegacy(ClassLoader classLoader) {
+        hookLegacyUpdateParams(classLoader);
+        hookLegacyStart(classLoader);
+        hookLegacyProcessRequestResult(classLoader);
+    }
+
+    /** 覆盖档位字段，随后被 start() 折算到 current* 字段。 */
+    private void hookLegacyUpdateParams(ClassLoader classLoader) {
         XposedHelpers.findAndHookMethod(CLASS_FILE_LOAD_OPERATION, classLoader, "updateParams",
                 new XC_MethodHook() {
                     @Override
@@ -118,23 +133,20 @@ public class SpeedHook extends XposedModule {
                         XposedHelpers.setIntField(param.thisObject, "downloadChunkSizeAnimation", downloadChunkSizeBig);
                         XposedHelpers.setIntField(param.thisObject, "maxDownloadRequestsAnimation", maxRequests);
 
-                        notifyBoost(param, speed, classLoader);
+                        notifyBoost(param.thisObject, XposedHelpers.getLongField(
+                                param.thisObject, "totalBytesCount"), speed, classLoader);
                     }
                 });
     }
 
     /**
-     * 覆盖真正生效的 current* 字段。
-     *
-     * <p>start() 只在 currentDownloadChunkSize == 0 时把档位字段折算过来，且 isStory / isStream /
-     * forceSmallChunk 各走不同分支。这里在其之后按同样的分支规则重新折算并强制写回，
-     * 使所有下载路径都遵循用户档位。
+     * 覆盖真正生效的 current* 字段，并处理 13.x 新增的下载预算。
      */
-    private void hookStart(ClassLoader classLoader) {
-        // Telegram 13.x 新增了下载预算机制（普通文档下载时启用），
-        // 非会员会被限制在 2 条连接上，这是 13.x 下载明显变慢的根因。
-        // 12.10.5 没有该字段，需要先探测再决定是否启用相关修正。
-        final boolean hasByteBudgetField = hasField(classLoader, "useDownloadByteBudget");
+    private void hookLegacyStart(ClassLoader classLoader) {
+        // Telegram 13.x 新增了 useDownloadByteBudget：普通文档下载时启用，
+        // 非会员会被限制在 2 条连接上，同时请求带上 0x40000 标志。
+        // 12.10.5 没有该字段，需要先探测。
+        final boolean hasByteBudgetField = hasField(CLASS_FILE_LOAD_OPERATION, classLoader, "useDownloadByteBudget");
 
         XposedHelpers.findAndHookMethod(CLASS_FILE_LOAD_OPERATION, classLoader, "start",
                 CLASS_FILE_LOAD_OPERATION_STREAM, long.class, boolean.class, new XC_MethodHook() {
@@ -145,20 +157,17 @@ public class SpeedHook extends XposedModule {
 
                         if (hasByteBudgetField
                                 && XposedHelpers.getBooleanField(operation, "useDownloadByteBudget")) {
-                            // 与 Telegram 会员档位对齐（8 条连接）。该值参与
-                            // connectionNum = requestsCount & (count - 1) 的计算，
-                            // 必须是 2 的幂才能覆盖完整的连接序号。
+                            // 与会员档位对齐（8 条连接）。该值参与
+                            // connectionNum = requestsCount & (count - 1)，必须是 2 的幂。
                             XposedHelpers.setIntField(operation, "downloadConnectionsCount",
                                     DOWNLOAD_CONNECTIONS_COUNT);
-                            // 关闭下载字节预算：开启时请求会带上
-                            // RequestFlagDownloadByteBudget (0x40000)，
-                            // 该标志会让 native 层对下载请求做吞吐限制。
+                            // 关闭字节预算，避免请求带上 RequestFlagDownloadByteBudget(0x40000)。
                             XposedHelpers.setBooleanField(operation, "useDownloadByteBudget", false);
                         }
 
                         if (XposedHelpers.getBooleanField(operation, "forceSmallChunk")) {
-                            // 服务器返回 LIMIT_INVALID 后 Telegram 会主动把分块降到 32KB，
-                            // 分块大小必须尊重这个纠错结果，但并发数不必跟着砍到 4。
+                            // 服务器返回 LIMIT_INVALID 后 Telegram 主动把分块降到 32KB，
+                            // 分块必须尊重这个纠错结果，但并发数不必跟着砍。
                             XposedHelpers.setIntField(operation, "currentMaxDownloadRequests",
                                     maxRequestsOf(speed));
                             return;
@@ -188,14 +197,8 @@ public class SpeedHook extends XposedModule {
                 });
     }
 
-    /**
-     * 抵消纠错降级对并发数的永久影响。
-     *
-     * <p>Telegram 收到 LIMIT_INVALID 时会把 currentMaxDownloadRequests 直接写成 4 并置
-     * forceSmallChunk，之后只调 startDownloadRequest() 重试、不再经过 start()，
-     * 因此并发数不会自行恢复。分块保持降级，并发则按档位复原。
-     */
-    private void hookProcessRequestResult(ClassLoader classLoader) {
+    /** 抵消 LIMIT_INVALID 纠错对并发数的永久影响。 */
+    private void hookLegacyProcessRequestResult(ClassLoader classLoader) {
         XposedHelpers.findAndHookMethod(CLASS_FILE_LOAD_OPERATION, classLoader, "processRequestResult",
                 CLASS_REQUEST_INFO, CLASS_TL_ERROR, new XC_MethodHook() {
                     @Override
@@ -204,17 +207,134 @@ public class SpeedHook extends XposedModule {
                         if (!XposedHelpers.getBooleanField(operation, "forceSmallChunk")) {
                             return;
                         }
-                        var speed = prefs.getString(KEY_SPEED, BOOST_AVERAGE);
                         XposedHelpers.setIntField(operation, "currentMaxDownloadRequests",
-                                maxRequestsOf(speed));
+                                maxRequestsOf(prefs.getString(KEY_SPEED, BOOST_AVERAGE)));
                     }
                 });
     }
 
-    /** 探测目标类（含父类）是否存在指定字段，用于兼容不同 Telegram 版本。 */
-    private static boolean hasField(ClassLoader classLoader, String fieldName) {
+    // ==================================================================
+    // 混淆路径（13.2.0+）
+    //
+    // 字段/方法对照（经 smali 逐条核对）：
+    //   t()      = updateParams()
+    //   q()      = start()
+    //   m(g7,TL_error)Z = processRequestResult()
+    //   n:I  = downloadChunkSizeBig        o:I  = maxDownloadRequests
+    //   p:I  = maxDownloadRequestsBig      q:I  = maxCdnParts
+    //   j0:I = currentDownloadChunkSize    k0:I = currentMaxDownloadRequests
+    //   f:Z  = useDownloadByteBudget       g:I  = downloadConnectionsCount
+    //   e:Z  = forceSmallChunk             j:Z  = isStory
+    //   r0:Z = isStream                    b0:J = totalBytesCount
+    // ==================================================================
+
+    private void hookObfuscated(ClassLoader classLoader) {
+        hookObfUpdateParams(classLoader);
+        hookObfStart(classLoader);
+        hookObfProcessRequestResult(classLoader);
+    }
+
+    /** t() = updateParams()：计算档位字段。 */
+    private void hookObfUpdateParams(ClassLoader classLoader) {
+        XposedHelpers.findAndHookMethod(CLASS_FILE_LOAD_OPERATION_OBF, classLoader, "t",
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        var speed = prefs.getString(KEY_SPEED, BOOST_AVERAGE);
+                        int chunkSize = chunkSizeOf(speed);
+                        int maxRequests = maxRequestsOf(speed);
+
+                        XposedHelpers.setIntField(param.thisObject, "n", chunkSize);
+                        XposedHelpers.setIntField(param.thisObject, "o", maxRequests);
+                        XposedHelpers.setIntField(param.thisObject, "p", maxRequests);
+                        XposedHelpers.setIntField(param.thisObject, "q",
+                                (int) (DEFAULT_MAX_FILE_SIZE / chunkSize));
+
+                        notifyBoost(param.thisObject,
+                                XposedHelpers.getLongField(param.thisObject, "b0"), speed, classLoader);
+                    }
+                });
+    }
+
+    /**
+     * q() = start()：折算 current* 字段。
+     *
+     * <p>13.2.0 的 q() 只在 currentDownloadChunkSize(j0) == 0 时按分支赋值，
+     * 且 isStream 分支硬编码 128KB/4、普通分支里还会调用 s() 用"字节预算"反推并发。
+     * 这里在 before 阶段预置 j0/k0，使那个 if 块整体跳过（对齐计算也用我们的分块，
+     * 不会产生错位），再在 after 兜底关闭预算开关。
+     */
+    private void hookObfStart(ClassLoader classLoader) {
+        XposedHelpers.findAndHookMethod(CLASS_FILE_LOAD_OPERATION_OBF, classLoader, "q",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        Object operation = param.thisObject;
+                        if (XposedHelpers.getBooleanField(operation, "e")) {
+                            // forceSmallChunk：让 Telegram 自己走 32KB/4 的纠错分支
+                            return;
+                        }
+                        var speed = prefs.getString(KEY_SPEED, BOOST_AVERAGE);
+                        XposedHelpers.setIntField(operation, "j0", chunkSizeOf(speed));
+                        XposedHelpers.setIntField(operation, "k0", maxRequestsOf(speed));
+                    }
+
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        Object operation = param.thisObject;
+                        var speed = prefs.getString(KEY_SPEED, BOOST_AVERAGE);
+
+                        if (XposedHelpers.getBooleanField(operation, "e")) {
+                            // 分块保持降级，只复原并发
+                            XposedHelpers.setIntField(operation, "k0", maxRequestsOf(speed));
+                            return;
+                        }
+
+                        if (XposedHelpers.getBooleanField(operation, "f")) {
+                            // 关闭字节预算：请求不再带 RequestFlagDownloadByteBudget(0x40000)
+                            XposedHelpers.setBooleanField(operation, "f", false);
+                            // 与会员档位对齐
+                            XposedHelpers.setIntField(operation, "g", DOWNLOAD_CONNECTIONS_COUNT);
+                            // s() 可能已把 k0 改写成"预算/分块"的结果，恢复为档位并发
+                            XposedHelpers.setIntField(operation, "k0", maxRequestsOf(speed));
+                        }
+                    }
+                });
+    }
+
+    /** m() = processRequestResult()。 */
+    private void hookObfProcessRequestResult(ClassLoader classLoader) {
+        XposedHelpers.findAndHookMethod(CLASS_FILE_LOAD_OPERATION_OBF, classLoader, "m",
+                CLASS_REQUEST_INFO_OBF, CLASS_TL_ERROR, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        Object operation = param.thisObject;
+                        if (!XposedHelpers.getBooleanField(operation, "e")) {
+                            return;
+                        }
+                        XposedHelpers.setIntField(operation, "k0",
+                                maxRequestsOf(prefs.getString(KEY_SPEED, BOOST_AVERAGE)));
+                    }
+                });
+    }
+
+    // ==================================================================
+    // 工具方法
+    // ==================================================================
+
+    private static boolean classExists(String className, ClassLoader classLoader) {
         try {
-            Class<?> clazz = XposedHelpers.findClass(CLASS_FILE_LOAD_OPERATION, classLoader);
+            XposedHelpers.findClass(className, classLoader);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** 探测目标类（含父类）是否存在指定字段，用于兼容不同 Telegram 版本。 */
+    private static boolean hasField(String className, ClassLoader classLoader, String fieldName) {
+        try {
+            Class<?> clazz = XposedHelpers.findClass(className, classLoader);
             for (Class<?> current = clazz; current != null; current = current.getSuperclass()) {
                 try {
                     current.getDeclaredField(fieldName);
@@ -253,12 +373,11 @@ public class SpeedHook extends XposedModule {
     }
 
     /** 大文件下载时提示一次当前档位，五分钟内不重复。 */
-    private void notifyBoost(XC_MethodHook.MethodHookParam param, String speed, ClassLoader classLoader) {
-        if (BOOST_NONE.equals(speed)) {
+    private void notifyBoost(Object operation, long fileSize, String speed, ClassLoader classLoader) {
+        if (BOOST_NONE.equals(speed) || res == null) {
             return;
         }
         try {
-            var fileSize = XposedHelpers.getLongField(param.thisObject, "totalBytesCount");
             if (fileSize <= 15 * 1024 * 1024
                     || System.currentTimeMillis() - speedUpShown <= 1000 * 60 * 5) {
                 return;
@@ -276,7 +395,8 @@ public class SpeedHook extends XposedModule {
             var title = res.getString(R.string.speed_toast);
             var subtitle = res.getString(R.string.speed_toast_level, "Nekogram", speedString);
             try {
-                var notificationCenterClass = XposedHelpers.findClass("org.telegram.messenger.NotificationCenter", classLoader);
+                var notificationCenterClass = XposedHelpers.findClass(
+                        "org.telegram.messenger.NotificationCenter", classLoader);
                 var globalInstance = XposedHelpers.callStaticMethod(notificationCenterClass, "getGlobalInstance");
                 new Handler(Looper.getMainLooper()).post(() -> XposedHelpers.callMethod(
                         globalInstance,

@@ -11,8 +11,8 @@ android {
         // libxposed API 102 要求 minSdk >= 26
         minSdkVersion 26
         targetSdkVersion 37
-        versionCode 9
-        versionName "2.0.1"
+        versionCode 10
+        versionName "2.1.0"
     }
 
     buildTypes {

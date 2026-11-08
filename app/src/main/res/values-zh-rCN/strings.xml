@@ -2,7 +2,7 @@
 <resources>
     <string name="xposed_description">提升你的 Telegram 下载速度。</string>
     <string name="speed_toast">下载速度已被 TeleSpeed 提升！</string>
-    <string name="speed_toast_level">源于 %s, 加速：%s</string>
+    <string name="speed_toast_level" formatted="false">源于 %s, 加速：%s</string>
     <string name="speed_level">加速</string>
     <string name="boost_none">关闭</string>
     <string name="boost_average">开启</string>

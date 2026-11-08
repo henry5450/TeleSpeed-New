@@ -67,13 +67,14 @@ ellipi.messenger
 
 ## 版本兼容性
 
-| Telegram 版本 | 状态 |
-| --- | --- |
-| 12.10.5 (71059) | ✅ 已验证 |
-| 13.0.3 (71839) | ✅ 已验证（需 v2.0.1+） |
+| Telegram 版本 | 状态 | 100 MB 实测 |
+| --- | --- | --- |
+| 12.10.5 (71059) | ✅ 已验证 | 约 8 s |
+| 13.0.3 (71839) | ✅ 已验证（v2.0.1+） | 约 10 s |
+| 13.2.0 (72809) | ✅ 已验证（v2.1.0+） | 约 11 s |
 
-Telegram 13.x 重构了下载参数体系并新增了一套下载节流机制，v2.0.0 在 13.x 上速度会明显下降
-（实测 100MB 需 25s，而 12.10.5 只需 8s）。v2.0.1 针对该机制做了适配，恢复到约 10s。
+Telegram 13.x 重构了下载参数体系并新增了下载节流机制，未适配时 100MB 需要约 25 秒。
+13.2.0 更进一步**混淆了整个下载模块**，v2.1.0 通过运行时探测同时兼容未混淆与混淆两种形态。
 
 ## 技术说明
 
@@ -119,6 +120,29 @@ pacedDownloadRequest:Runnable         useDownloadByteBudget:Z
 
 本模块在 `start()` 的 after 阶段把连接数提到 8，并关闭 `useDownloadByteBudget`，
 从而绕过这套限制。字段探测保证在 12.10.5（无这些字段）上不受影响。
+
+### Telegram 13.2.0 的混淆与字节预算
+
+13.2.0 对下载模块做了完整 R8 混淆：类名变为 `h7`，**所有字段名和方法名都被重命名**
+（`updateParams()` → `t()`、`start()` → `q()`、`processRequestResult()` → `m()`，
+`downloadChunkSizeBig` → `n`、`currentDownloadChunkSize` → `j0` 等）。
+
+更关键的是 `s()` 里的并发计算改成了**按字节预算反推**：
+
+```java
+if (useDownloadByteBudget) {
+    int budget = isPremium() ? 16 : 2;          // MB
+    currentMaxDownloadRequests = budget * 0x100000 / currentDownloadChunkSize;
+}
+```
+
+也就是说无论分块调多大，总在途数据都被锁死在固定值，调大分块只会相应减少并发数。
+本模块在 `start()` 之前预置「当前分块/并发」字段，使这段折算逻辑整体跳过，
+并在其后关闭预算开关、恢复连接数。
+
+模块启动时会先探测 `FileLoadOperation` 是否存在，不存在则回退到混淆类 `h7`（通过特征字符串
+`LIMIT_INVALID`、`invalid cdn hash`、`debug_loading: restart with small chunk` 核对过）。
+若未来 Telegram 再次改名，模块会退回「不支持的版本」提示而不会崩溃。
 
 ## 构建
 

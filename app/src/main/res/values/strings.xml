@@ -2,7 +2,7 @@
     <string name="app_name">TeleSpeed</string>
     <string name="xposed_description">Speed up your Telegram download.</string>
     <string name="speed_toast">Download speed boosted by TeleSpeed!</string>
-    <string name="speed_toast_level">By %s, Boost: %s</string>
+    <string name="speed_toast_level" formatted="false">By %s, Boost: %s</string>
     <string name="speed_level">Boost</string>
     <string name="boost_none">Disabled</string>
     <string name="boost_average">Enabled</string>
