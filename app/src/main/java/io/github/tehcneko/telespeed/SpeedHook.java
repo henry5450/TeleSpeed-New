@@ -5,6 +5,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.widget.Toast;
 
+import java.lang.reflect.Method;
+
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam;
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam;
@@ -46,9 +48,13 @@ public class SpeedHook extends XposedModule {
     private static final String CLASS_REQUEST_INFO =
             "org.telegram.messenger.FileLoadOperation$RequestInfo";
 
-    // ---- 混淆版本（13.2.0+）。类名可能随版本变化，靠特征字符串核对过 ----
-    private static final String CLASS_FILE_LOAD_OPERATION_OBF = "org.telegram.messenger.h7";
-    private static final String CLASS_REQUEST_INFO_OBF = "org.telegram.messenger.g7";
+    // ---- 混淆版本（13.2.0+）。类名每次发版都可能变，这里维护候选列表 ----
+    // 注意：R8 会复用旧名字。13.3.1 里 "h7" 仍然存在，但已变成另一个 7 字段的小类，
+    // 所以不能只看类是否存在，必须做结构校验。
+    private static final String[] OBF_OPERATION_CANDIDATES = {
+            "org.telegram.messenger.d7",   // 13.3.1
+            "org.telegram.messenger.h7",   // 13.2.0
+    };
 
     private static final String CLASS_TL_ERROR = "org.telegram.tgnet.TLRPC$TL_error";
 
@@ -84,10 +90,12 @@ public class SpeedHook extends XposedModule {
         try {
             if (classExists(CLASS_FILE_LOAD_OPERATION, classLoader)) {
                 hookLegacy(classLoader);
-            } else if (classExists(CLASS_FILE_LOAD_OPERATION_OBF, classLoader)) {
-                hookObfuscated(classLoader);
             } else {
-                throw new ClassNotFoundException("找不到 FileLoadOperation 或其混淆版本");
+                Class<?> operation = findObfuscatedOperation(classLoader);
+                if (operation == null) {
+                    throw new ClassNotFoundException("找不到 FileLoadOperation 或其混淆版本");
+                }
+                hookObfuscated(operation, classLoader);
             }
         } catch (Throwable t) {
             XposedBridge.log(t);
@@ -228,15 +236,18 @@ public class SpeedHook extends XposedModule {
     //   r0:Z = isStream                    b0:J = totalBytesCount
     // ==================================================================
 
-    private void hookObfuscated(ClassLoader classLoader) {
-        hookObfUpdateParams(classLoader);
-        hookObfStart(classLoader);
-        hookObfProcessRequestResult(classLoader);
+    private void hookObfuscated(Class<?> operation, ClassLoader classLoader) {
+        final String className = operation.getName();
+        XposedBridge.log("TeleSpeed: 使用混淆下载类 " + className);
+
+        hookObfUpdateParams(className, classLoader);
+        hookObfStart(className, classLoader);
+        hookObfProcessRequestResult(operation, classLoader);
     }
 
     /** t() = updateParams()：计算档位字段。 */
-    private void hookObfUpdateParams(ClassLoader classLoader) {
-        XposedHelpers.findAndHookMethod(CLASS_FILE_LOAD_OPERATION_OBF, classLoader, "t",
+    private void hookObfUpdateParams(String className, ClassLoader classLoader) {
+        XposedHelpers.findAndHookMethod(className, classLoader, "t",
                 new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) throws Throwable {
@@ -264,8 +275,8 @@ public class SpeedHook extends XposedModule {
      * 这里在 before 阶段预置 j0/k0，使那个 if 块整体跳过（对齐计算也用我们的分块，
      * 不会产生错位），再在 after 兜底关闭预算开关。
      */
-    private void hookObfStart(ClassLoader classLoader) {
-        XposedHelpers.findAndHookMethod(CLASS_FILE_LOAD_OPERATION_OBF, classLoader, "q",
+    private void hookObfStart(String className, ClassLoader classLoader) {
+        XposedHelpers.findAndHookMethod(className, classLoader, "q",
                 new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
@@ -302,20 +313,97 @@ public class SpeedHook extends XposedModule {
                 });
     }
 
-    /** m() = processRequestResult()。 */
-    private void hookObfProcessRequestResult(ClassLoader classLoader) {
-        XposedHelpers.findAndHookMethod(CLASS_FILE_LOAD_OPERATION_OBF, classLoader, "m",
-                CLASS_REQUEST_INFO_OBF, CLASS_TL_ERROR, new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        Object operation = param.thisObject;
-                        if (!XposedHelpers.getBooleanField(operation, "e")) {
-                            return;
-                        }
-                        XposedHelpers.setIntField(operation, "k0",
-                                maxRequestsOf(prefs.getString(KEY_SPEED, BOOST_AVERAGE)));
-                    }
-                });
+    /**
+     * m() = processRequestResult()。
+     *
+     * <p>RequestInfo 的混淆名每个版本都会变（13.2.0 是 g7，13.3.1 是 c7），
+     * 所以这里不写字面量，直接从 m() 的第二个参数类型反射取得。
+     */
+    private void hookObfProcessRequestResult(Class<?> operationClass, ClassLoader classLoader) {
+        Method target = findProcessRequestResult(operationClass);
+        if (target == null) {
+            XposedBridge.log("TeleSpeed: 未找到 processRequestResult 等价方法，跳过纠错恢复");
+            return;
+        }
+        XposedHelpers.hookMethod(target, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                Object operation = param.thisObject;
+                if (!XposedHelpers.getBooleanField(operation, "e")) {
+                    return;
+                }
+                XposedHelpers.setIntField(operation, "k0",
+                        maxRequestsOf(prefs.getString(KEY_SPEED, BOOST_AVERAGE)));
+            }
+        });
+    }
+
+    // ==================================================================
+    // 混淆类的定位
+    // ==================================================================
+
+    /**
+     * 按候选名逐个尝试，并用结构特征校验。
+     *
+     * <p>不能仅凭"类存在"判断：R8 会复用旧名字，13.3.1 里 {@code h7} 仍然存在，
+     * 但已变成另一个只有 7 个字段的小类。
+     */
+    private static Class<?> findObfuscatedOperation(ClassLoader classLoader) {
+        for (String name : OBF_OPERATION_CANDIDATES) {
+            try {
+                Class<?> clazz = XposedHelpers.findClass(name, classLoader);
+                boolean ok = isFileLoadOperation(clazz);
+                XposedBridge.log("TeleSpeed: 候选 " + name
+                        + " 字段=" + clazz.getDeclaredFields().length
+                        + " 方法=" + clazz.getDeclaredMethods().length
+                        + " 校验=" + (ok ? "通过" : "不符"));
+                if (ok) {
+                    return clazz;
+                }
+            } catch (Throwable t) {
+                XposedBridge.log("TeleSpeed: 候选 " + name + " 不存在");
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 结构校验：真实的下载类应同时具备
+     * <ul>
+     *   <li>无参 void 的 t()（updateParams）与 q()（start）；</li>
+     *   <li>{@code m(RequestInfo, TL_error)boolean}（processRequestResult）。</li>
+     * </ul>
+     */
+    private static boolean isFileLoadOperation(Class<?> clazz) {
+        return findProcessRequestResult(clazz) != null
+                && hasNoArgVoid(clazz, "t")
+                && hasNoArgVoid(clazz, "q");
+    }
+
+    private static boolean hasNoArgVoid(Class<?> clazz, String name) {
+        try {
+            Method m = clazz.getDeclaredMethod(name);
+            return m.getReturnType() == void.class;
+        } catch (NoSuchMethodException e) {
+            return false;
+        }
+    }
+
+    /** 找到 processRequestResult 的等价方法：两参、返回 boolean、第二个参数是 TL_error。 */
+    private static Method findProcessRequestResult(Class<?> clazz) {
+        for (Method m : clazz.getDeclaredMethods()) {
+            if (m.getParameterCount() != 2
+                    || m.getReturnType() != boolean.class
+                    || !m.getParameterTypes()[1].getName().equals(CLASS_TL_ERROR)) {
+                continue;
+            }
+            // 第一个参数是 RequestInfo（对象类型，混淆名每版不同，不做名字匹配）
+            if (m.getParameterTypes()[0].isPrimitive()) {
+                continue;
+            }
+            return m;
+        }
+        return null;
     }
 
     // ==================================================================
